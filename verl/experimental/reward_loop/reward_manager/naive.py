@@ -13,11 +13,16 @@
 # limitations under the License.
 
 import inspect
+import logging
+import os
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @register("naive")
@@ -41,10 +46,10 @@ class NaiveRewardManager(RewardManagerBase):
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        extra_info = dict(data_item.non_tensor_batch.get("extra_info", {}) or {})
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
         if tool_extra_fields is not None:
-            extra_info.update(tool_extra_fields.items())
+            extra_info.update(tool_extra_fields)
 
         num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
         rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
@@ -54,6 +59,7 @@ class NaiveRewardManager(RewardManagerBase):
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
+        extra_info["truncated"] = self._is_truncated(valid_response_ids, response_str)
 
         extra_reward_kwargs = (
             {
@@ -63,37 +69,57 @@ class NaiveRewardManager(RewardManagerBase):
             if self.reward_router_address is not None
             else {}
         )
-        if self.is_async_reward_score:
-            result = await self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                **extra_reward_kwargs,
-            )
-        else:
-            result = await self.loop.run_in_executor(
-                None,
-                lambda: self.compute_score(
+        reward_extra_info = {"truncated": extra_info["truncated"]}
+
+        try:
+            if self.is_async_reward_score:
+                result = await self.compute_score(
                     data_source=data_source,
                     solution_str=response_str,
                     ground_truth=ground_truth,
                     extra_info=extra_info,
                     **extra_reward_kwargs,
-                ),
+                )
+            else:
+                result = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.compute_score(
+                        data_source=data_source,
+                        solution_str=response_str,
+                        ground_truth=ground_truth,
+                        extra_info=extra_info,
+                        **extra_reward_kwargs,
+                    ),
+                )
+
+            score: float
+            if isinstance(result, dict):
+                score = result["score"]
+                reward_extra_info.update(result)
+            else:
+                score = result
+                reward_extra_info["acc"] = score
+        except Exception as e:
+            logger.error(
+                f"Reward computation failed for data_source={data_source}: {e}. "
+                f"Response preview: {response_str[:100]}..."
             )
-
-        reward_extra_info = {}
-
-        score: float
-        if isinstance(result, dict):
-            score = result["score"]
-            for key, value in result.items():
-                reward_extra_info[key] = value
-        else:
-            score = result
-            reward_extra_info["acc"] = score
+            score = 0.0
+            reward_extra_info["error"] = str(e)
+            reward_extra_info["acc"] = 0.0
 
         reward = score
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
+
+    def _is_truncated(self, valid_response_ids, response_str: str) -> bool:
+        if len(valid_response_ids) == 0:
+            return False
+
+        stop_token_ids = {self.tokenizer.eos_token_id}
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end_id, int) and im_end_id != self.tokenizer.unk_token_id:
+            stop_token_ids.add(im_end_id)
+
+        last_token_id = int(valid_response_ids[-1])
+        return last_token_id not in stop_token_ids and not response_str.rstrip().endswith("<|im_end|>")
