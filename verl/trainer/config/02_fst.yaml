@@ -1,0 +1,20 @@
+# FST (GEPA + RL) defaults.
+
+defaults:
+  - 01_rl_baseline
+  - _self_
+
+gepa:
+  enabled: True
+  warmstart_steps: 6
+  rl_steps_per_cycle: 6
+  num_prompts: 8
+  prompts_per_question: 8
+  advantage_grouping: question
+  prompt_position: system_role
+  num_eval_examples: 192
+  max_metric_calls: 960
+  reflection_lm: openai/gpt-5.2
+  seed_prompt: ""
+  background: ""
+  objective: ""

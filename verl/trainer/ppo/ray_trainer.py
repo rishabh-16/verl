@@ -1361,6 +1361,127 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # GEPA prompt co-optimization state. This first FST path supports
+        # prompt injection, trajectory feedback, and GEPA prefetch/replay.
+        gepa_cfg = self.config.get("gepa", {})
+        gepa_enabled = bool(gepa_cfg.get("enabled", False))
+        if gepa_enabled:
+            from gepa_integration import GEPAIntegrationConfig, GEPAPromptOptimizer, PromptInjector, TrajectoryBuffer
+            from gepa_integration.prompt_injector import inject_gepa_prompt
+            from verl.utils.dataset.rl_dataset import collate_fn as gepa_collate_fn
+
+            gepa_config = GEPAIntegrationConfig(**{k: v for k, v in gepa_cfg.items() if k != "enabled"})
+            gepa_buffer = TrajectoryBuffer(trainset_size=gepa_config.trainset_size)
+            gepa_injector = PromptInjector(
+                num_prompts=gepa_config.num_prompts,
+                prompts_per_question=gepa_config.prompts_per_question,
+                advantage_grouping=gepa_config.advantage_grouping,
+                prompt_position=gepa_config.prompt_position,
+            )
+            gepa_optimizer = GEPAPromptOptimizer(gepa_config)
+            gepa_active = False
+            gepa_cycle_counter = 0
+            print(
+                f"[GEPA] Enabled: warmstart={gepa_config.warmstart_steps}, "
+                f"rl_per_cycle={gepa_config.rl_steps_per_cycle}, "
+                f"num_prompts={gepa_config.num_prompts}, "
+                f"prompts_per_question={gepa_config.prompts_per_question}, "
+                f"num_eval_examples={gepa_config.num_eval_examples}, "
+                f"reflection_lm={gepa_config.reflection_lm}",
+                flush=True,
+            )
+
+            def _uncollate_gepa_batches(batch_dicts: list[dict]) -> list[dict]:
+                items = []
+                for prefetched in batch_dicts:
+                    size = None
+                    for value in prefetched.values():
+                        if hasattr(value, "__len__") and not isinstance(value, str):
+                            size = len(value)
+                            break
+                    if size is None:
+                        continue
+                    for idx in range(size):
+                        item = {}
+                        for key, value in prefetched.items():
+                            if isinstance(value, torch.Tensor):
+                                item[key] = value[idx]
+                            elif isinstance(value, np.ndarray):
+                                item[key] = value[idx]
+                            elif isinstance(value, (list, tuple)) and len(value) == size:
+                                item[key] = value[idx]
+                            else:
+                                item[key] = value
+                        items.append(item)
+                return items
+
+            def _generate_and_score_gepa(candidate_prompt: str, items: list[dict], *, is_valset: bool = False):
+                if not items:
+                    return []
+                eval_batch = DataProto.from_single_dict(gepa_collate_fn(items))
+                eval_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(eval_batch.batch))], dtype=object
+                )
+                raw_prompts = eval_batch.non_tensor_batch["raw_prompt"]
+                for idx in range(len(raw_prompts)):
+                    messages = [dict(message) for message in raw_prompts[idx]]
+                    inject_gepa_prompt(messages, candidate_prompt, gepa_config.prompt_position)
+                    raw_prompts[idx] = messages
+
+                gen_eval_batch = self._get_gen_batch(eval_batch)
+                gen_eval_batch.meta_info["global_steps"] = self.global_steps
+                gen_eval_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                gen_output = self.async_rollout_manager.generate_sequences(gen_eval_batch)
+                self.checkpoint_manager.sleep_replicas()
+                eval_batch = eval_batch.union(gen_output)
+
+                if "response_mask" not in eval_batch.batch.keys():
+                    eval_batch.batch["response_mask"] = compute_response_mask(eval_batch)
+                if self.use_rm and "rm_scores" not in eval_batch.batch.keys():
+                    eval_batch = eval_batch.union(self._compute_reward_colocate(eval_batch))
+
+                reward_tensor, reward_extra_infos_dict = extract_reward(eval_batch)
+                self.checkpoint_manager.update_weights(self.global_steps)
+
+                prompt_len = eval_batch.batch["prompts"].shape[1]
+                responses = eval_batch.batch["responses"]
+                attention_mask = eval_batch.batch["attention_mask"]
+                reward_model_infos = eval_batch.non_tensor_batch.get("reward_model", [{}] * len(eval_batch))
+                scores = reward_extra_infos_dict.get("score")
+                if scores is None:
+                    scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+                feedbacks = reward_extra_infos_dict.get("feedback", [""] * len(eval_batch))
+
+                results = []
+                for idx in range(len(eval_batch)):
+                    response_mask = attention_mask[idx, prompt_len:]
+                    response_ids = responses[idx][response_mask.bool()]
+                    reward_model_info = reward_model_infos[idx]
+                    ground_truth = (
+                        reward_model_info.get("ground_truth", "")
+                        if isinstance(reward_model_info, dict)
+                        else ""
+                    )
+                    results.append(
+                        (
+                            float(scores[idx]),
+                            {
+                                "response": self.tokenizer.decode(response_ids, skip_special_tokens=False),
+                                "feedback": str(feedbacks[idx]) if idx < len(feedbacks) else "",
+                                "ground_truth": str(ground_truth),
+                                "is_valset": is_valset,
+                            },
+                        )
+                    )
+                return results
+        else:
+            gepa_config = None
+            gepa_buffer = None
+            gepa_injector = None
+            gepa_optimizer = None
+            gepa_active = False
+            gepa_cycle_counter = 0
+
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1368,9 +1489,18 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+        gepa_replay_buffer: list[dict] = []
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            train_iter = iter(self.train_dataloader)
+            while True:
+                if gepa_enabled and gepa_replay_buffer:
+                    batch_dict = gepa_replay_buffer.pop(0)
+                else:
+                    try:
+                        batch_dict = next(train_iter)
+                    except StopIteration:
+                        break
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1390,12 +1520,25 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                gepa_original_raw_prompts = None
+                if gepa_enabled:
+                    gepa_original_raw_prompts = batch.non_tensor_batch["raw_prompt"].copy()
+                    if gepa_active:
+                        gepa_injector.inject(batch, gepa_optimizer.get_current_prompts())
+                        batch.meta_info["gepa_injected"] = True
+
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                rollout_n = self.config.actor_rollout_ref.rollout.n
-                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                repeat_n = self.config.actor_rollout_ref.rollout.n
+                if gepa_enabled and gepa_active and gepa_config.prompts_per_question > 1:
+                    assert repeat_n % gepa_config.prompts_per_question == 0, (
+                        f"rollout.n ({repeat_n}) must be divisible by "
+                        f"gepa.prompts_per_question ({gepa_config.prompts_per_question})"
+                    )
+                    repeat_n = repeat_n // gepa_config.prompts_per_question
+                gen_batch_output = gen_batch.repeat(repeat_times=repeat_n, interleave=True)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
@@ -1444,7 +1587,7 @@ class RayPPOTrainer:
                         del gen_baseline_output
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(repeat_times=repeat_n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1473,6 +1616,58 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    if gepa_enabled:
+                        gepa_buffer.add_from_batch(
+                            batch,
+                            reward_extra_infos_dict,
+                            self.tokenizer,
+                            prompt_assignment=gepa_injector.last_assignment if gepa_active else None,
+                            global_step=self.global_steps,
+                            original_raw_prompts=gepa_original_raw_prompts,
+                        )
+                        gepa_cycle_counter += 1
+                        should_run_gepa = (
+                            (not gepa_active and gepa_cycle_counter >= gepa_config.warmstart_steps)
+                            or (gepa_active and gepa_cycle_counter >= gepa_config.rl_steps_per_cycle)
+                        )
+                        if should_run_gepa:
+                            phase = "warmstart_complete" if not gepa_active else "cycle_complete"
+                            print(
+                                f"[GEPA] Running optimization ({phase}, "
+                                f"buffer_size={len(gepa_buffer.get_records())})",
+                                flush=True,
+                            )
+                            eval_batch_size = self.config.data.get(
+                                "gen_batch_size", self.config.data.train_batch_size
+                            )
+                            num_prefetch = -(-gepa_config.num_eval_examples // eval_batch_size)
+                            prefetched_batch_dicts = []
+                            for _ in range(num_prefetch):
+                                try:
+                                    prefetched_batch_dicts.append(next(train_iter))
+                                except StopIteration:
+                                    break
+                            next_items = _uncollate_gepa_batches(prefetched_batch_dicts)[
+                                : gepa_config.num_eval_examples
+                            ]
+                            gepa_replay_buffer.extend(prefetched_batch_dicts)
+                            if next_items:
+                                gepa_optimizer.run(
+                                    gepa_buffer,
+                                    next_items,
+                                    _generate_and_score_gepa,
+                                    global_step=self.global_steps,
+                                    experiment_name=self.config.trainer.experiment_name,
+                                )
+                                gepa_active = True
+                                gepa_cycle_counter = 0
+                                metrics["gepa/active"] = 1.0
+                                metrics["gepa/prompt_pool_size"] = float(
+                                    len(gepa_optimizer.get_current_prompts())
+                                )
+                            else:
+                                print("[GEPA] Skipping optimization: no prefetched eval items", flush=True)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
