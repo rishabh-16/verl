@@ -1431,7 +1431,11 @@ class RayPPOTrainer:
                 gen_eval_batch = self._get_gen_batch(eval_batch)
                 gen_eval_batch.meta_info["global_steps"] = self.global_steps
                 gen_eval_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                gen_output = self.async_rollout_manager.generate_sequences(gen_eval_batch)
+                size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+                gen_eval_batch_padded, pad_size = pad_dataproto_to_divisor(gen_eval_batch, size_divisor)
+                self.checkpoint_manager.update_weights(self.global_steps)
+                gen_output_padded = self.async_rollout_manager.generate_sequences(gen_eval_batch_padded)
+                gen_output = unpad_dataproto(gen_output_padded, pad_size=pad_size)
                 self.checkpoint_manager.sleep_replicas()
                 eval_batch = eval_batch.union(gen_output)
 
@@ -1441,7 +1445,6 @@ class RayPPOTrainer:
                     eval_batch = eval_batch.union(self._compute_reward_colocate(eval_batch))
 
                 reward_tensor, reward_extra_infos_dict = extract_reward(eval_batch)
-                self.checkpoint_manager.update_weights(self.global_steps)
 
                 prompt_len = eval_batch.batch["prompts"].shape[1]
                 responses = eval_batch.batch["responses"]
