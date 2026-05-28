@@ -27,7 +27,7 @@ def _loads(value: str) -> Any:
 def _is_valid_json(value: str) -> bool:
     try:
         _loads(value)
-    except json.JSONDecodeError:
+    except Exception:
         return False
     return True
 
@@ -104,7 +104,7 @@ def _build_feedback(pred_str: str | None, ground_truth: str) -> str:
     try:
         pred = _loads(pred_str)
         expected = _loads(ground_truth)
-    except json.JSONDecodeError:
+    except Exception:
         return f"Your answer could not be parsed as JSON. Expected: {ground_truth}"
 
     if pred == expected:
@@ -142,7 +142,7 @@ def compute_score(solution_str: str, ground_truth: str, extra_info: dict[str, An
     elif len(pred_str) > _MAX_SCORE_INPUT_CHARS or len(ground_truth) > _MAX_SCORE_INPUT_CHARS:
         try:
             score = 1.0 if _loads(pred_str) == _loads(ground_truth) else 0.0
-        except json.JSONDecodeError:
+        except Exception:
             score = 0.0
     else:
         score = _score_fn(pred_str, {"answer": ground_truth})

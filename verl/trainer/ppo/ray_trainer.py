@@ -499,6 +499,74 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
+    def _log_all_trajectories(self, batch: DataProto, step: int):
+        """Save every rollout sample for this step to JSONL and wandb."""
+        if not self.config.trainer.get("log_all_trajectories", False):
+            return
+
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        attention_mask = batch.batch["attention_mask"]
+        prompt_len = prompts.shape[1]
+        batch_size = batch.batch.batch_size[0]
+        uids = batch.non_tensor_batch.get("uid", [None] * batch_size)
+        reward_model_infos = batch.non_tensor_batch.get("reward_model")
+        gepa_prompt_ids = batch.non_tensor_batch.get("gepa_prompt_id")
+        has_advantages = "advantages" in batch.batch
+
+        records = []
+        for idx in range(batch_size):
+            prompt_mask = attention_mask[idx, :prompt_len]
+            response_mask = attention_mask[idx, prompt_len:]
+            prompt_text = self.tokenizer.decode(prompts[idx][prompt_mask.bool()], skip_special_tokens=True)
+            response_text = self.tokenizer.decode(responses[idx][response_mask.bool()], skip_special_tokens=True)
+            score = float(batch.batch["token_level_scores"][idx].sum().item())
+
+            reward_model_info = reward_model_infos[idx] if reward_model_infos is not None else {}
+            ground_truth = (
+                str(reward_model_info.get("ground_truth", ""))
+                if isinstance(reward_model_info, dict)
+                else ""
+            )
+
+            record = {
+                "step": step,
+                "uid": str(uids[idx]) if uids[idx] is not None else None,
+                "sample_idx": idx,
+                "score": score,
+                "ground_truth": ground_truth,
+                "prompt": prompt_text,
+                "response": response_text,
+            }
+            if gepa_prompt_ids is not None:
+                record["gepa_prompt_id"] = str(gepa_prompt_ids[idx])
+            if has_advantages:
+                record["advantage"] = float(batch.batch["advantages"][idx].sum().item())
+            records.append(record)
+
+        if not records:
+            return
+
+        traj_dir = os.path.join(self.config.trainer.default_local_dir, "trajectories")
+        os.makedirs(traj_dir, exist_ok=True)
+        jsonl_path = os.path.join(traj_dir, f"step_{step}.jsonl")
+        with open(jsonl_path, "w") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        print(f"Dumped all trajectories to {jsonl_path}", flush=True)
+
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                columns = list(records[0].keys())
+                table = wandb.Table(columns=columns)
+                for record in records:
+                    table.add_data(*[record.get(column) for column in columns])
+                wandb.log({f"trajectories/step_{step}": table}, step=step)
+        except Exception as exc:
+            print(f"[trajectories] Failed to log wandb table: {exc}", flush=True)
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -566,6 +634,17 @@ class RayPPOTrainer:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
+
+            gepa_eval_prompts = getattr(self, "_gepa_eval_prompts", None)
+            if gepa_eval_prompts:
+                from gepa_integration.prompt_injector import inject_gepa_prompt
+
+                raw_prompts = test_batch.non_tensor_batch["raw_prompt"]
+                prompt_position = getattr(self, "_gepa_prompt_position", "system_role")
+                for idx in range(len(raw_prompts)):
+                    prompt_text = gepa_eval_prompts[idx % len(gepa_eval_prompts)]
+                    messages = [dict(message) for message in raw_prompts[idx]]
+                    raw_prompts[idx] = inject_gepa_prompt(messages, prompt_text, prompt_position)
 
             # repeat test batch
             test_batch = test_batch.repeat(
@@ -1331,6 +1410,11 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        gepa_validation_cfg = self.config.get("gepa", {})
+        self._gepa_prompt_position = gepa_validation_cfg.get("prompt_position", "system_role")
+        self._gepa_eval_prompts = []
+        if gepa_validation_cfg.get("enabled", False) and gepa_validation_cfg.get("seed_prompt"):
+            self._gepa_eval_prompts = [gepa_validation_cfg.seed_prompt]
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -1420,7 +1504,7 @@ class RayPPOTrainer:
                     return []
                 eval_batch = DataProto.from_single_dict(gepa_collate_fn(items))
                 eval_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(eval_batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(eval_batch))], dtype=object
                 )
                 raw_prompts = eval_batch.non_tensor_batch["raw_prompt"]
                 for idx in range(len(raw_prompts)):
@@ -1664,6 +1748,7 @@ class RayPPOTrainer:
                                     experiment_name=self.config.trainer.experiment_name,
                                 )
                                 gepa_active = True
+                                self._gepa_eval_prompts = gepa_optimizer.get_current_prompts()
                                 gepa_cycle_counter = 0
                                 metrics["gepa/active"] = 1.0
                                 metrics["gepa/prompt_pool_size"] = float(
@@ -1829,6 +1914,7 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    self._log_all_trajectories(batch=batch, step=self.global_steps)
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (

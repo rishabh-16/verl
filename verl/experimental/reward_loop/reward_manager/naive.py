@@ -105,8 +105,16 @@ class NaiveRewardManager(RewardManagerBase):
                 f"Response preview: {response_str[:100]}..."
             )
             score = 0.0
-            reward_extra_info["error"] = str(e)
-            reward_extra_info["acc"] = 0.0
+            reward_extra_info.update(
+                {
+                    "score": 0.0,
+                    "acc": 0.0,
+                    "pred": "",
+                    "feedback": f"Reward computation failed: {e}",
+                    "incorrect_format": 1,
+                    "error": str(e),
+                }
+            )
 
         reward = score
 

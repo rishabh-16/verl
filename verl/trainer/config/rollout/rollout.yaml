@@ -52,6 +52,9 @@ cudagraph_capture_sizes: null
 # Whether to free engine KVCache after generation.
 free_cache_engine: True
 
+# Whether to offload/sleep rollout engine between generation phases.
+enable_sleep_mode: True
+
 # TP size for rollout. Not effective for hf
 tensor_model_parallel_size: 2
 

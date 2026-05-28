@@ -139,6 +139,12 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Whether to save every training rollout to default_local_dir/trajectories
+  log_all_trajectories: false
+
+  # Step interval for optional trace logging; 0 disables
+  log_trace_interval: 0
+
   # Number of nodes used in the training
   nnodes: 1
 
